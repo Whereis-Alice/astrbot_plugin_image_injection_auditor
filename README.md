@@ -11,6 +11,7 @@ Too many images were provided, we currently limit the number of images per conve
 - 统计当前请求中的 `req.image_urls` 图片。
 - 统计 `req.extra_user_content_parts` 中的 `ImageURLPart` 图片。
 - 可选统计 `req.contexts` / Agent 上下文里已经存在的历史图片。
+- 尝试识别上一轮请求里的图片是否被带入本轮上下文。
 - 尝试识别来源插件：
   - 通过包装 `req.image_urls` / `req.extra_user_content_parts` 捕获 `append`、`extend`、`insert`、切片赋值等注入动作。
   - 通过调用栈识别 `astrbot_plugin_*` 插件目录名。
@@ -22,10 +23,11 @@ Too many images were provided, we currently limit the number of images per conve
 
 ```text
 [ImageAudit] phase=llm_request umo=aiocqhttp:GroupMessage:12345 session=... model=-
-images_total=34 current=18 context_or_history=16 warn_limit=30
+images_total=34 current=18 context_or_history=16 history_carryover=12 warn_limit=30
 [ImageAudit] channels: request.contexts=16, request.image_urls=12, request.extra_user_content_parts=6
 [ImageAudit] sources: conversation_history=16, astrbot_plugin_video_vision_helper=12, astrbot_plugin_gif_frame_vision=6
 [ImageAudit] tracked mutations: astrbot_plugin_video_vision_helper request.image_urls.extend +12 [...]
+[ImageAudit] carryover: previous_request_images=12 matched_history_images=12
 ```
 
 ## 说明
@@ -35,3 +37,5 @@ images_total=34 current=18 context_or_history=16 warn_limit=30
 本插件默认只记录日志，不会删除或修改任何图片输入。
 
 注意：如果某个插件直接执行 `req.image_urls = new_list` 替换整个列表，`tracked mutations` 不会显示这次赋值动作；最终 `sources` 仍会通过前后差异和图片路径特征尽量归因。
+
+如果同一会话里第二次请求的 `context_or_history` 变大，通常不是重复注入，而是 AstrBot 正常把上一轮多模态消息放进了对话历史；这时重点看 `history_carryover` 和 `carryover` 日志，能更快确认到底是不是把上一轮帧又送了一遍。

@@ -23,6 +23,12 @@
     "description": "记录 Agent 开始前的上下文图片数",
     "hint": "该日志发生在 AgentRunner 创建后、上下文压缩前，可帮助确认历史图片是否已经进入本轮上下文。"
   },
+  "track_history_carryover": {
+    "type": "bool",
+    "default": true,
+    "description": "识别上一轮图片是否被带入本轮上下文",
+    "hint": "插件会根据图片内容和本地路径生成指纹，尽量判断当前上下文里的图片是否来自上一轮请求。"
+  },
   "log_tool_result_images": {
     "type": "bool",
     "default": true,

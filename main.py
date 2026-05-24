@@ -5,6 +5,8 @@ Log how many images enter each LLM request and where they likely came from.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import inspect
 import os
@@ -13,6 +15,7 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import unquote, urlparse
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -21,8 +24,8 @@ from astrbot.api.star import Context, Star, register
 
 
 PLUGIN_ID = "astrbot_plugin_image_injection_auditor"
-PLUGIN_VERSION = "0.1.0"
-PLUGIN_DESC = "审计每次 LLM 请求中的图片数量，并尽量标记来源插件"
+PLUGIN_VERSION = "0.1.1"
+PLUGIN_DESC = "审计每次 LLM 请求中的图片数量、来源插件，并标记历史回带"
 PLUGIN_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_image_injection_auditor"
 
 STATE_EXTRA_KEY = f"{PLUGIN_ID}.state"
@@ -118,6 +121,7 @@ class ImageInjectionAuditor(Star):
         super().__init__(context, config)
         self.config = config or {}
         self._last_summary_by_umo: dict[str, str] = {}
+        self._last_direct_fingerprints_by_umo: dict[str, set[str]] = {}
 
     async def initialize(self) -> None:
         logger.info("[%s] plugin initialized", PLUGIN_ID)
@@ -179,6 +183,7 @@ class ImageInjectionAuditor(Star):
             state=state,
             phase="llm_request",
         )
+        self._remember_direct_images(event.unified_msg_origin, final_entries)
 
     @filter.on_agent_begin(priority=LATE_PRIORITY)
     async def audit_agent_context(
@@ -290,6 +295,11 @@ class ImageInjectionAuditor(Star):
             if entry.channel in {"request.contexts", "agent.messages"}
         )
         total_count = len(entries)
+        history_carryover_count = (
+            self._history_carryover_count(event.unified_msg_origin, entries)
+            if self._cfg_bool("track_history_carryover", True)
+            else 0
+        )
         warn_limit = self._cfg_int("warn_image_limit", 30)
         is_over_limit = warn_limit > 0 and total_count >= warn_limit
         log_fn = logger.warning if is_over_limit else logger.info
@@ -300,11 +310,21 @@ class ImageInjectionAuditor(Star):
             f"[ImageAudit] phase={phase} umo={event.unified_msg_origin} "
             f"session={session_id or '-'} model={model or '-'} "
             f"images_total={total_count} current={current_count} "
-            f"context_or_history={context_count} warn_limit={warn_limit}"
+            f"context_or_history={context_count} history_carryover={history_carryover_count} "
+            f"warn_limit={warn_limit}"
         )
         log_fn(summary)
         log_fn("[ImageAudit] channels: %s", self._format_counter(channel_counts))
         log_fn("[ImageAudit] sources: %s", self._format_counter(source_counts))
+        if history_carryover_count and self._cfg_bool("track_history_carryover", True):
+            previous_direct_count = len(
+                self._last_direct_fingerprints_by_umo.get(event.unified_msg_origin, set())
+            )
+            log_fn(
+                "[ImageAudit] carryover: previous_request_images=%s matched_history_images=%s",
+                previous_direct_count,
+                history_carryover_count,
+            )
 
         if state and state.mutations:
             mutation_lines = [
@@ -586,13 +606,66 @@ class ImageInjectionAuditor(Star):
         return "unknown"
 
     def _fingerprint(self, ref: str) -> str:
-        if ref.startswith(("data:", "base64://", "mcp-image:")):
-            digest = hashlib.sha256(ref.encode("utf-8", "ignore")).hexdigest()[:16]
-            return f"inline:{len(ref)}:{digest}"
+        raw_bytes = self._extract_image_bytes(ref)
+        if raw_bytes is not None:
+            digest = hashlib.sha256(raw_bytes).hexdigest()[:16]
+            return f"content:{len(raw_bytes)}:{digest}"
         normalized = ref.strip()
         if not self._looks_like_url(normalized):
             normalized = os.path.normcase(os.path.normpath(normalized))
         return normalized
+
+    def _extract_image_bytes(self, ref: str) -> bytes | None:
+        if not ref:
+            return None
+
+        if ref.startswith("data:"):
+            payload = ref.split(",", 1)
+            if len(payload) != 2:
+                return None
+            header, body = payload
+            if ";base64" not in header:
+                return body.encode("utf-8", "ignore")
+            try:
+                return base64.b64decode(body, validate=False)
+            except (binascii.Error, ValueError):
+                return None
+
+        if ref.startswith("base64://"):
+            try:
+                return base64.b64decode(ref.removeprefix("base64://"), validate=False)
+            except (binascii.Error, ValueError):
+                return None
+
+        if ref.startswith("mcp-image:"):
+            if "," not in ref:
+                return None
+            payload = ref.split(",", 1)[1]
+            try:
+                return base64.b64decode(payload, validate=False)
+            except (binascii.Error, ValueError):
+                return None
+
+        path = self._local_path_from_ref(ref)
+        if path is None:
+            return None
+        try:
+            return Path(path).read_bytes()
+        except OSError:
+            return None
+
+    def _local_path_from_ref(self, ref: str) -> str | None:
+        if self._looks_like_url(ref) and not ref.startswith("file://"):
+            return None
+        if ref.startswith("file://"):
+            parsed = urlparse(ref)
+            path = unquote(parsed.path or "")
+            if os.name == "nt" and path.startswith("/") and len(path) > 2 and path[2] == ":":
+                path = path[1:]
+            if parsed.netloc and not path.startswith("/"):
+                path = f"//{parsed.netloc}{path}"
+            return path or None
+        return ref
 
     @staticmethod
     def _looks_like_url(value: str) -> bool:
@@ -680,3 +753,23 @@ class ImageInjectionAuditor(Star):
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    def _history_carryover_count(self, umo: str, entries: list[ImageEntry]) -> int:
+        previous_direct = self._last_direct_fingerprints_by_umo.get(umo)
+        if not previous_direct:
+            return 0
+
+        history_channels = {"request.contexts", "agent.messages"}
+        return sum(
+            1
+            for entry in entries
+            if entry.channel in history_channels and entry.fingerprint in previous_direct
+        )
+
+    def _remember_direct_images(self, umo: str, entries: list[ImageEntry]) -> None:
+        direct_channels = {"request.image_urls", "request.extra_user_content_parts"}
+        direct_fingerprints = {
+            entry.fingerprint for entry in entries if entry.channel in direct_channels
+        }
+        if direct_fingerprints:
+            self._last_direct_fingerprints_by_umo[umo] = direct_fingerprints
