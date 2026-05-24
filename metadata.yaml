@@ -1,9 +1,9 @@
 name: astrbot_plugin_image_injection_auditor
-display_name: ???????
+display_name: 图片注入审计器
 version: 0.1.0
 author: Whereis-Alice
-desc: ???? AstrBot LLM ????????,??????????
-short_desc: ???????????
+desc: 审计每次 AstrBot LLM 请求中的图片数量，并尽量标记来源插件。
+short_desc: 统计图片注入数量与来源
 astrbot_version: ">=4.16,<5"
 repo: https://github.com/Whereis-Alice/astrbot_plugin_image_injection_auditor
 tags:

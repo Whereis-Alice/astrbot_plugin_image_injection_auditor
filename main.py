@@ -22,7 +22,7 @@ from astrbot.api.star import Context, Star, register
 
 PLUGIN_ID = "astrbot_plugin_image_injection_auditor"
 PLUGIN_VERSION = "0.1.0"
-PLUGIN_DESC = "???? LLM ????????,?????????"
+PLUGIN_DESC = "审计每次 LLM 请求中的图片数量，并尽量标记来源插件"
 PLUGIN_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_image_injection_auditor"
 
 STATE_EXTRA_KEY = f"{PLUGIN_ID}.state"
@@ -239,7 +239,7 @@ class ImageInjectionAuditor(Star):
         """Show the last image audit summary for this conversation."""
         summary = self._last_summary_by_umo.get(event.unified_msg_origin)
         if not summary:
-            yield event.plain_result("ImageAudit: ????????????")
+            yield event.plain_result("ImageAudit: 当前会话还没有审计记录。")
             return
         yield event.plain_result(summary)
 
