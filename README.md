@@ -1,0 +1,1 @@
+# astrbot_plugin_image_injection_auditor
