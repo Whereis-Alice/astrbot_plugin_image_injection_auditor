@@ -10,6 +10,8 @@ import binascii
 import hashlib
 import inspect
 import os
+import urllib.error
+import urllib.request
 import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
@@ -24,8 +26,8 @@ from astrbot.api.star import Context, Star, register
 
 
 PLUGIN_ID = "astrbot_plugin_image_injection_auditor"
-PLUGIN_VERSION = "0.1.1"
-PLUGIN_DESC = "审计每次 LLM 请求中的图片数量、来源插件，并标记历史回带"
+PLUGIN_VERSION = "0.2.0"
+PLUGIN_DESC = "审计每次 LLM 请求中的图片数量、来源插件，并移除无法解析的坏图"
 PLUGIN_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_image_injection_auditor"
 
 STATE_EXTRA_KEY = f"{PLUGIN_ID}.state"
@@ -39,6 +41,27 @@ class ImageEntry:
     location: str
     ref: str
     fingerprint: str
+
+
+@dataclass(frozen=True)
+class ImageValidation:
+    status: str
+    reason: str
+    image_type: str = ""
+    byte_length: int | None = None
+
+    @property
+    def is_invalid(self) -> bool:
+        return self.status == "invalid"
+
+
+@dataclass(frozen=True)
+class RemovedImageRecord:
+    entry: ImageEntry
+    source: str
+    reason: str
+    image_type: str = ""
+    byte_length: int | None = None
 
 
 @dataclass(frozen=True)
@@ -175,6 +198,17 @@ class ImageInjectionAuditor(Star):
             return
 
         attributed_sources = self._attribute_sources(final_entries, state)
+        removed_images: list[RemovedImageRecord] = []
+        if self._cfg_bool("remove_invalid_images", True):
+            removed_images = self._remove_invalid_request_images(
+                req=req,
+                entries=final_entries,
+                sources=attributed_sources,
+            )
+            if removed_images:
+                final_entries = self._collect_provider_request_images(req)
+                attributed_sources = self._attribute_sources(final_entries, state)
+
         self._log_summary(
             event=event,
             req=req,
@@ -182,6 +216,7 @@ class ImageInjectionAuditor(Star):
             sources=attributed_sources,
             state=state,
             phase="llm_request",
+            removed_images=removed_images,
         )
         self._remember_direct_images(event.unified_msg_origin, final_entries)
 
@@ -209,6 +244,7 @@ class ImageInjectionAuditor(Star):
             sources=sources,
             state=self._get_state(event, None),
             phase="agent_begin_pre_compaction",
+            removed_images=[],
         )
 
     @filter.on_llm_tool_respond(priority=LATE_PRIORITY)
@@ -237,6 +273,7 @@ class ImageInjectionAuditor(Star):
             sources=sources,
             state=self._get_state(event, None),
             phase="llm_tool_result",
+            removed_images=[],
         )
 
     @filter.command("image_audit_status")
@@ -280,6 +317,7 @@ class ImageInjectionAuditor(Star):
         sources: list[str],
         state: AuditState | None,
         phase: str,
+        removed_images: list[RemovedImageRecord],
     ) -> None:
         source_counts = Counter(sources)
         channel_counts = Counter(entry.channel for entry in entries)
@@ -337,6 +375,25 @@ class ImageInjectionAuditor(Star):
             ]
             log_fn("[ImageAudit] tracked mutations: %s", " | ".join(mutation_lines))
 
+        if removed_images:
+            removed_lines = [
+                (
+                    f"#{index + 1} {record.source} {record.entry.location} "
+                    f"{record.reason} {self._preview_ref(record.entry.ref)}"
+                )
+                for index, record in enumerate(
+                    removed_images[: self._cfg_int("removed_detail_limit", 8)]
+                )
+            ]
+            extra_count = len(removed_images) - len(removed_lines)
+            if extra_count > 0:
+                removed_lines.append(f"...(+{extra_count} more)")
+            logger.warning(
+                "[ImageAudit] removed invalid images: count=%s %s",
+                len(removed_images),
+                " | ".join(removed_lines),
+            )
+
         if self._cfg_bool("include_details", True):
             detail_limit = self._cfg_int("detail_limit", 12)
             details = self._format_details(entries, sources, detail_limit)
@@ -346,7 +403,8 @@ class ImageInjectionAuditor(Star):
         self._last_summary_by_umo[event.unified_msg_origin] = (
             f"{summary}\n"
             f"channels: {self._format_counter(channel_counts)}\n"
-            f"sources: {self._format_counter(source_counts)}"
+            f"sources: {self._format_counter(source_counts)}\n"
+            f"removed_invalid_images: {len(removed_images)}"
         )
         self._trim_last_summaries()
 
@@ -418,6 +476,144 @@ class ImageInjectionAuditor(Star):
                     )
                 )
         return entries
+
+    def _remove_invalid_request_images(
+        self,
+        *,
+        req: ProviderRequest,
+        entries: list[ImageEntry],
+        sources: list[str],
+    ) -> list[RemovedImageRecord]:
+        if not entries:
+            return []
+
+        invalid_by_channel_location: dict[tuple[str, str], RemovedImageRecord] = {}
+        for entry, source in zip(entries, sources):
+            validation = self._validate_image_ref(entry.ref)
+            if not validation.is_invalid:
+                continue
+            invalid_by_channel_location[(entry.channel, entry.location)] = (
+                RemovedImageRecord(
+                    entry=entry,
+                    source=source,
+                    reason=validation.reason,
+                    image_type=validation.image_type,
+                    byte_length=validation.byte_length,
+                )
+            )
+
+        if not invalid_by_channel_location:
+            return []
+
+        remove_context_images = self._cfg_bool("remove_invalid_context_images", True)
+        removable_invalid = {
+            key: record
+            for key, record in invalid_by_channel_location.items()
+            if remove_context_images or key[0] != "request.contexts"
+        }
+        if not removable_invalid:
+            return []
+
+        self._filter_request_image_urls(req, removable_invalid)
+        self._filter_extra_user_content_parts(req, removable_invalid)
+        if remove_context_images:
+            self._filter_context_images(req, removable_invalid)
+
+        return list(removable_invalid.values())
+
+    def _filter_request_image_urls(
+        self,
+        req: ProviderRequest,
+        invalid: dict[tuple[str, str], RemovedImageRecord],
+    ) -> None:
+        values = list(getattr(req, "image_urls", []) or [])
+        if not values:
+            return
+        kept = [
+            value
+            for index, value in enumerate(values)
+            if ("request.image_urls", f"image_urls[{index}]") not in invalid
+        ]
+        if len(kept) != len(values):
+            req.image_urls = kept
+
+    def _filter_extra_user_content_parts(
+        self,
+        req: ProviderRequest,
+        invalid: dict[tuple[str, str], RemovedImageRecord],
+    ) -> None:
+        values = list(getattr(req, "extra_user_content_parts", []) or [])
+        if not values:
+            return
+        kept = [
+            value
+            for index, value in enumerate(values)
+            if (
+                "request.extra_user_content_parts",
+                f"extra_user_content_parts[{index}]",
+            )
+            not in invalid
+        ]
+        if len(kept) != len(values):
+            req.extra_user_content_parts = kept
+
+    def _filter_context_images(
+        self,
+        req: ProviderRequest,
+        invalid: dict[tuple[str, str], RemovedImageRecord],
+    ) -> None:
+        contexts = getattr(req, "contexts", None)
+        if not isinstance(contexts, list):
+            return
+        kept_contexts: list[Any] = []
+        for index, context in enumerate(contexts):
+            if ("request.contexts", f"contexts[{index}]") in invalid:
+                continue
+            self._filter_context_content_images(
+                context,
+                channel="request.contexts",
+                location=f"contexts[{index}]",
+                invalid=invalid,
+            )
+            kept_contexts.append(context)
+        if len(kept_contexts) != len(contexts):
+            req.contexts = kept_contexts
+
+    def _filter_context_content_images(
+        self,
+        context: Any,
+        *,
+        channel: str,
+        location: str,
+        invalid: dict[tuple[str, str], RemovedImageRecord],
+    ) -> None:
+        content = context.get("content") if isinstance(context, dict) else getattr(context, "content", None)
+        if isinstance(content, list):
+            kept_parts = [
+                part
+                for index, part in enumerate(content)
+                if (channel, f"{location}.content[{index}]") not in invalid
+            ]
+            if len(kept_parts) == len(content):
+                return
+            if isinstance(context, dict):
+                context["content"] = kept_parts
+            else:
+                try:
+                    setattr(context, "content", kept_parts)
+                except Exception:
+                    pass
+            return
+
+        if (channel, location) not in invalid:
+            return
+        if isinstance(context, dict):
+            context["content"] = ""
+        else:
+            try:
+                setattr(context, "content", "")
+            except Exception:
+                pass
 
     def _collect_message_images(
         self,
@@ -653,6 +849,134 @@ class ImageInjectionAuditor(Star):
             return Path(path).read_bytes()
         except OSError:
             return None
+
+    def _validate_image_ref(self, ref: str) -> ImageValidation:
+        if not ref or not ref.strip():
+            return ImageValidation(status="invalid", reason="empty image reference")
+
+        ref = ref.strip()
+        if self._looks_like_url(ref) and not ref.startswith("file://"):
+            if not self._cfg_bool("validate_remote_images", False):
+                return ImageValidation(status="unknown", reason="remote validation disabled")
+            return self._validate_remote_image_ref(ref)
+
+        raw_bytes = self._extract_image_bytes(ref)
+        if raw_bytes is None:
+            if ref.startswith(("data:", "base64://", "mcp-image:", "file://")):
+                return ImageValidation(
+                    status="invalid",
+                    reason="image bytes could not be decoded or read",
+                )
+            return ImageValidation(status="unknown", reason="not a local/inline image")
+        return self._validate_image_bytes(raw_bytes)
+
+    def _validate_remote_image_ref(self, ref: str) -> ImageValidation:
+        timeout = max(1, self._cfg_int("remote_validation_timeout_seconds", 5))
+        max_bytes = max(1024, self._cfg_int("remote_validation_max_bytes", 65536))
+        request = urllib.request.Request(
+            ref,
+            method="GET",
+            headers={"User-Agent": f"{PLUGIN_ID}/{PLUGIN_VERSION}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status = getattr(response, "status", 200)
+                content_type = response.headers.get("content-type", "")
+                data = response.read(max_bytes)
+        except (OSError, urllib.error.URLError, ValueError) as exc:
+            return ImageValidation(
+                status="invalid",
+                reason=f"remote image fetch failed: {type(exc).__name__}",
+            )
+
+        if status >= 400:
+            return ImageValidation(
+                status="invalid",
+                reason=f"remote image returned HTTP {status}",
+                byte_length=len(data),
+            )
+        validation = self._validate_image_bytes(data)
+        if validation.is_invalid and "image/" not in content_type.lower():
+            return ImageValidation(
+                status="invalid",
+                reason=f"remote content-type is not image: {content_type or '-'}",
+                byte_length=len(data),
+            )
+        return validation
+
+    def _validate_image_bytes(self, raw_bytes: bytes) -> ImageValidation:
+        min_bytes = max(1, self._cfg_int("min_image_bytes", 16))
+        byte_length = len(raw_bytes)
+        if byte_length < min_bytes:
+            return ImageValidation(
+                status="invalid",
+                reason=f"image is too small: {byte_length} bytes",
+                byte_length=byte_length,
+            )
+
+        image_type = self._detect_image_type(raw_bytes)
+        if image_type:
+            return ImageValidation(
+                status="valid",
+                reason="recognized image signature",
+                image_type=image_type,
+                byte_length=byte_length,
+            )
+
+        prefix = raw_bytes[:256].lstrip().lower()
+        if prefix.startswith((b"<html", b"<!doctype html", b"{", b"[", b"<?xml")):
+            return ImageValidation(
+                status="invalid",
+                reason="bytes look like text/html/json/xml, not an image",
+                byte_length=byte_length,
+            )
+        if self._looks_like_text(raw_bytes[:512]):
+            return ImageValidation(
+                status="invalid",
+                reason="bytes look like plain text, not an image",
+                byte_length=byte_length,
+            )
+        return ImageValidation(
+            status="invalid",
+            reason="unrecognized image signature",
+            byte_length=byte_length,
+        )
+
+    @staticmethod
+    def _detect_image_type(raw_bytes: bytes) -> str:
+        if raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "png"
+        if raw_bytes.startswith(b"\xff\xd8\xff"):
+            return "jpeg"
+        if raw_bytes.startswith((b"GIF87a", b"GIF89a")):
+            return "gif"
+        if raw_bytes.startswith(b"BM"):
+            return "bmp"
+        if len(raw_bytes) >= 12 and raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WEBP":
+            return "webp"
+        if len(raw_bytes) >= 12 and raw_bytes[4:8] == b"ftyp":
+            brand = raw_bytes[8:12]
+            if brand in {
+                b"heic",
+                b"heix",
+                b"hevc",
+                b"hevx",
+                b"mif1",
+                b"msf1",
+                b"avif",
+            }:
+                return brand.decode("ascii", "ignore")
+        return ""
+
+    @staticmethod
+    def _looks_like_text(raw_bytes: bytes) -> bool:
+        if not raw_bytes:
+            return False
+        textish = 0
+        for byte in raw_bytes:
+            if byte in {9, 10, 13} or 32 <= byte <= 126:
+                textish += 1
+        return textish / len(raw_bytes) > 0.9
 
     def _local_path_from_ref(self, ref: str) -> str | None:
         if self._looks_like_url(ref) and not ref.startswith("file://"):

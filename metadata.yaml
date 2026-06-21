@@ -1,9 +1,9 @@
 name: astrbot_plugin_image_injection_auditor
 display_name: 图片注入审计器
-version: 0.1.1
+version: 0.2.0
 author: Whereis-Alice
-desc: 审计每次 AstrBot LLM 请求中的图片数量、来源插件，并标记历史回带。
-short_desc: 统计图片注入数量、来源与历史回带
+desc: 审计每次 AstrBot LLM 请求中的图片数量、来源插件，并在发送前移除无法解析的坏图。
+short_desc: 统计图片来源并清理坏图
 astrbot_version: ">=4.16,<5"
 repo: https://github.com/Whereis-Alice/astrbot_plugin_image_injection_auditor
 tags:

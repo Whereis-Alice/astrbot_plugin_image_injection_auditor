@@ -17,6 +17,48 @@
     "description": "统计会话历史中的图片",
     "hint": "OpenAI 兼容接口的 30 张图片限制通常按整段 messages/conversation 计算，因此建议保持开启。"
   },
+  "remove_invalid_images": {
+    "type": "bool",
+    "default": true,
+    "description": "发送模型前移除坏图片",
+    "hint": "开启后会移除空引用、解码失败、文件不存在、明显不是图片的本地/内联图片，避免所有模型请求都因为同一张坏图 400。"
+  },
+  "remove_invalid_context_images": {
+    "type": "bool",
+    "default": true,
+    "description": "同时清理历史上下文里的坏图片",
+    "hint": "建议开启。坏图片常常来自历史上下文回带；不清理 contexts 的话 fallback 模型也会继续失败。"
+  },
+  "validate_remote_images": {
+    "type": "bool",
+    "default": false,
+    "description": "联网验证远程图片 URL",
+    "hint": "默认关闭以避免增加延迟。开启后会请求远程 URL 的前一段内容，若返回错误页或非图片内容则移除。"
+  },
+  "remote_validation_timeout_seconds": {
+    "type": "int",
+    "default": 5,
+    "description": "远程图片验证超时时间",
+    "hint": "仅在开启联网验证远程图片 URL 时生效。"
+  },
+  "remote_validation_max_bytes": {
+    "type": "int",
+    "default": 65536,
+    "description": "远程图片验证读取字节数",
+    "hint": "只读取开头一小段用于判断文件头，避免下载完整大图。"
+  },
+  "min_image_bytes": {
+    "type": "int",
+    "default": 16,
+    "description": "最小图片字节数",
+    "hint": "小于该字节数的本地/内联图片会被视为坏图。"
+  },
+  "removed_detail_limit": {
+    "type": "int",
+    "default": 8,
+    "description": "坏图移除日志明细数量",
+    "hint": "一次请求移除很多坏图时，日志只展示前若干条。"
+  },
   "log_agent_context": {
     "type": "bool",
     "default": true,
